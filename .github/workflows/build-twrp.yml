@@ -1,0 +1,228 @@
+name: Build TWRP
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean_build:
+        description: "Do a clean build (wipe out/ before building)"
+        required: false
+        default: "false"
+        type: boolean
+  push:
+    branches:
+      - twrp-12.1
+    paths:
+      - "**.mk"
+      - "**.cpp"
+      - "**.h"
+      - "prebuilt/**"
+      - "recovery.fstab"
+      - "vendor.prop"
+
+jobs:
+  build:
+    name: Build TWRP vendor_boot
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ── Maximize disk space ──────────────────────────────────────────────────
+      # The free GitHub runner only has ~14 GB free by default.
+      # TWRP source + out/ easily exceeds that, so we nuke unused toolchains.
+      - name: Free disk space
+        run: |
+          echo "Before:"
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+          echo "After:"
+          df -h /
+
+      # ── Install build dependencies ───────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git-core gnupg flex bison build-essential zip curl \
+            zlib1g-dev libc6-dev-i386 lib32ncurses5-dev \
+            x11proto-core-dev libx11-dev lib32z1-dev \
+            libgl1-mesa-dev libxml2-utils xsltproc unzip \
+            fontconfig python3 python-is-python3 \
+            schedtool libncurses5 rsync ccache
+
+      # ── Set up repo tool ─────────────────────────────────────────────────────
+      - name: Set up repo
+        run: |
+          mkdir -p ~/.bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+          chmod a+x ~/.bin/repo
+          echo "$HOME/.bin" >> $GITHUB_PATH
+
+      # ── Configure git identity (required by repo) ────────────────────────────
+      - name: Configure git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
+
+      # ── Restore cached TWRP source ───────────────────────────────────────────
+      # Caching the source saves ~20 min on subsequent runs.
+      - name: Cache TWRP source
+        id: cache-source
+        uses: actions/cache@v4
+        with:
+          path: twrp
+          key: twrp-source-12.1-${{ runner.os }}-v1
+          restore-keys: |
+            twrp-source-12.1-${{ runner.os }}-
+
+      # ── Init + sync TWRP source (only if cache miss) ─────────────────────────
+      - name: Sync TWRP source
+        if: steps.cache-source.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p twrp && cd twrp
+          repo init --depth=1 \
+            -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
+            -b twrp-12.1
+          # Fix known gflags conflict in minimal manifest
+          sed -i '/<remove-project name="platform\/external\/gflags" \/>/d' \
+            .repo/manifests/remove-minimal.xml
+          repo sync -c -j$(nproc) --force-sync --no-clone-bundle --no-tags
+
+      # ── Checkout device tree ─────────────────────────────────────────────────
+      - name: Checkout device tree
+        uses: actions/checkout@v4
+        with:
+          path: twrp/device/samsung/a56x
+
+      # ── Optional clean build ─────────────────────────────────────────────────
+      - name: Clean out/ directory
+        if: ${{ inputs.clean_build == 'true' }}
+        working-directory: twrp
+        run: rm -rf out/
+
+      # ── Set up ccache ────────────────────────────────────────────────────────
+      - name: Set up ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-twrp-a56x-${{ github.sha }}
+          restore-keys: |
+            ccache-twrp-a56x-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=5G
+          echo "USE_CCACHE=1" >> $GITHUB_ENV
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      # ── Build ────────────────────────────────────────────────────────────────
+      - name: Build vendor_boot
+        working-directory: twrp
+        run: |
+          source build/envsetup.sh
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export USE_CCACHE=1
+          export CCACHE_DIR=$HOME/.ccache
+          lunch twrp_a56x-eng
+          mka vendorbootimage -j$(nproc) 2>&1 | tee ../build.log
+          echo "BUILD_STATUS=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      # ── Collect artifacts ────────────────────────────────────────────────────
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          cp twrp/out/target/product/a56x/vendor_boot.img artifacts/ || true
+          cp build.log artifacts/
+          # Print image info
+          if [ -f artifacts/vendor_boot.img ]; then
+            ls -lah artifacts/vendor_boot.img
+            echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+          else
+            echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
+          fi
+
+      # ── Upload to GoFile ─────────────────────────────────────────────────────
+      - name: Upload to GoFile
+        if: env.BUILD_SUCCESS == 'true'
+        run: |
+          # Step 1: Get the best available upload server
+          SERVER=$(curl -s https://api.gofile.io/servers | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          if data.get('status') == 'ok':
+              print(data['data']['servers'][0]['name'])
+          else:
+              print('store1')
+          ")
+          echo "GoFile server: $SERVER"
+
+          # Step 2: Upload the file
+          FILENAME="TWRP-a56x-$(echo ${{ github.sha }} | cut -c1-7).img"
+          cp artifacts/vendor_boot.img artifacts/$FILENAME
+
+          RESPONSE=$(curl -s \
+            -F "file=@artifacts/$FILENAME" \
+            https://$SERVER.gofile.io/uploadFile)
+
+          echo "GoFile response: $RESPONSE"
+
+          # Step 3: Parse and export the download link
+          DOWNLOAD_URL=$(echo $RESPONSE | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          if data.get('status') == 'ok':
+              print(data['data']['downloadPage'])
+          else:
+              print('UPLOAD_FAILED')
+          ")
+
+          if [ "$DOWNLOAD_URL" = "UPLOAD_FAILED" ]; then
+            echo "::warning::GoFile upload failed. Response: $RESPONSE"
+          else
+            echo "GOFILE_URL=$DOWNLOAD_URL" >> $GITHUB_ENV
+            echo "::notice::GoFile download link: $DOWNLOAD_URL"
+          fi
+
+      # ── Post GoFile link to job summary ──────────────────────────────────────
+      - name: Post download link to summary
+        if: env.BUILD_SUCCESS == 'true' && env.GOFILE_URL != ''
+        run: |
+          echo "## ✅ TWRP Build Successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Device** | Samsung Galaxy A56x |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Download** | ${{ env.GOFILE_URL }} |" >> $GITHUB_STEP_SUMMARY
+
+      # ── Upload vendor_boot.img ───────────────────────────────────────────────
+      - name: Upload vendor_boot.img
+        if: env.BUILD_SUCCESS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: TWRP-a56x-${{ github.sha }}
+          path: artifacts/vendor_boot.img
+          retention-days: 7
+
+      # ── Always upload build log ──────────────────────────────────────────────
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.sha }}
+          path: artifacts/build.log
+          retention-days: 7
+
+      # ── Fail the job explicitly if build failed ──────────────────────────────
+      - name: Check build result
+        if: env.BUILD_SUCCESS == 'false'
+        run: |
+          echo "::error::vendor_boot.img not found — build failed. Check build log artifact."
+          exit 1
